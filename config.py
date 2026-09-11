@@ -15,6 +15,7 @@ class Config:
     ALERT_SCORE = float(os.getenv("ALERT_SCORE", "70"))
     STRONG_SCORE = float(os.getenv("STRONG_SCORE", "85"))
     COOLDOWN_MINUTES = int(os.getenv("COOLDOWN_MINUTES", "60"))
+    CONVERGENCE_WINDOW_MINUTES = int(os.getenv("CONVERGENCE_WINDOW_MINUTES", "60"))
     QUOTE_ASSETS = {x.strip().lower() for x in os.getenv(
         "QUOTE_ASSETS",
         "0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73,0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168"
