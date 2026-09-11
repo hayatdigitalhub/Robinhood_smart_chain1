@@ -33,15 +33,28 @@ class SmartMoneyEngine:
         if not tx_hashes:
             logging.info("Alchemy event contained no transaction hashes; nothing to process")
         count = 0
+        activity_by_hash = {}
+        for a in activities:
+            h = a.get("hash") or a.get("transactionHash")
+            if h:
+                activity_by_hash.setdefault(h, []).append(a)
+
         for tx_hash in tx_hashes:
             try:
-                count += int(bool(self.process_transaction(tx_hash)))
+                count += int(bool(self.process_transaction(tx_hash, activity_by_hash.get(tx_hash, []))))
             except Exception:
                 logging.exception("Failed transaction %s", tx_hash)
         return count
 
-    def process_transaction(self, tx_hash):
+    def process_transaction(self, tx_hash, webhook_activities=None):
         logging.info("Processing transaction %s", tx_hash)
+        webhook_activities = webhook_activities or []
+        if webhook_activities:
+            summary = [
+                f"{a.get('category')}:{a.get('asset') or a.get('rawContract', {}).get('address') or 'native'}"
+                for a in webhook_activities
+            ]
+            logging.info("Webhook activities for %s: %s", tx_hash, ", ".join(summary))
         receipt = self.chain.get_receipt(tx_hash)
         if not receipt:
             logging.warning("No receipt returned for transaction %s", tx_hash)
@@ -51,8 +64,45 @@ class SmartMoneyEngine:
             return False
 
         transfers = self.chain.receipt_transfers(receipt)
-        logging.info("Transaction %s contains %d ERC20 Transfer logs", tx_hash, len(transfers))
+
+        # Alchemy Address Activity is itself an indexed transfer feed. Prefer its
+        # token-transfer records when available; this also covers cases where a
+        # provider receipt is valid but its log representation is incomplete.
+        webhook_transfers = []
+        for a in webhook_activities:
+            category = str(a.get("category") or "").lower()
+            if category not in {"token", "erc20"}:
+                continue
+            raw = a.get("rawContract") or {}
+            token = (raw.get("address") or a.get("contractAddress") or "").lower()
+            if not token:
+                continue
+            raw_value = raw.get("rawValue") or "0x0"
+            try:
+                amount_raw = int(raw_value, 16) if isinstance(raw_value, str) else int(raw_value or 0)
+            except (TypeError, ValueError):
+                amount_raw = 0
+            webhook_transfers.append({
+                "token": token,
+                "from": (a.get("fromAddress") or "").lower(),
+                "to": (a.get("toAddress") or "").lower(),
+                "amount_raw": amount_raw,
+                "source": "alchemy_webhook",
+            })
+
+        if webhook_transfers:
+            transfers = webhook_transfers
+            logging.info("Using %d token transfers directly from Alchemy Address Activity", len(transfers))
+        else:
+            logging.info("Transaction %s contains %d ERC20 Transfer logs", tx_hash, len(transfers))
+
         if not transfers:
+            # Native ETH-only activity is valid, but cannot by itself identify a
+            # token buy. Keep the event visible in logs rather than treating it as
+            # an RPC failure.
+            native_activities = [a for a in webhook_activities if str(a.get("asset") or "").upper() == "ETH" or str(a.get("category") or "").lower() in {"external", "internal"}]
+            if native_activities:
+                logging.info("Transaction %s has %d native ETH activities; no token transfer to score", tx_hash, len(native_activities))
             return False
 
         block = int(receipt.get("blockNumber", "0x0"), 16)

@@ -115,10 +115,15 @@ class RobinhoodChain:
             topics = log.get("topics", [])
             if len(topics) < 3 or topics[0].lower() != TRANSFER_TOPIC.lower():
                 continue
+            data = log.get("data") or "0x"
+            try:
+                amount_raw = int(data, 16) if data not in ("0x", "0X", "") else 0
+            except (TypeError, ValueError):
+                amount_raw = 0
             out.append({
-                "token": log["address"].lower(),
+                "token": (log.get("address") or "").lower(),
                 "from": "0x" + topics[1][-40:].lower(),
                 "to": "0x" + topics[2][-40:].lower(),
-                "amount_raw": int(topics[3], 16) if len(topics) > 3 else 0,
+                "amount_raw": amount_raw,
             })
         return out
