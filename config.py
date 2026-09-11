@@ -7,6 +7,13 @@ class Config:
     RH_CHAIN_ID = int(os.getenv("RH_CHAIN_ID", "4663"))
     RH_RPC_URL = os.getenv("RH_RPC_URL", "https://rpc.mainnet.chain.robinhood.com")
     ALCHEMY_API_KEY = os.getenv("ALCHEMY_API_KEY", "")
+    # Optional explicit endpoint; otherwise derive the official Robinhood
+    # Mainnet Alchemy endpoint from ALCHEMY_API_KEY.
+    ALCHEMY_RPC_URL = os.getenv(
+        "ALCHEMY_RPC_URL",
+        f"https://robinhood-mainnet.g.alchemy.com/v2/{ALCHEMY_API_KEY}"
+        if ALCHEMY_API_KEY else ""
+    )
     ALCHEMY_WEBHOOK_SIGNING_KEY = os.getenv("ALCHEMY_WEBHOOK_SIGNING_KEY", "")
     TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
     TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")

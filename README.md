@@ -83,3 +83,9 @@ The engine has been syntax-checked and tested with isolated runtime fakes for:
 - duplicate trade protection.
 
 For production validation, replay several real Robinhood Chain transactions from the monitored wallets and compare the engine's classification with the transaction traces/events on the block explorer.
+
+## RPC reliability (v3.1 fix)
+
+The engine now uses the official Alchemy Robinhood Mainnet RPC first when `ALCHEMY_API_KEY` is configured, with the public Robinhood RPC as fallback. Transaction receipts are retried before the engine declares them missing. This prevents an Address Activity webhook that arrives immediately around transaction inclusion from being dropped because the first receipt lookup returns `null`.
+
+Required Render variable: `ALCHEMY_API_KEY` (the same key used for the Alchemy webhook/app). `ALCHEMY_RPC_URL` is optional.
