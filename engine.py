@@ -55,6 +55,7 @@ class SmartMoneyEngine:
                 for a in webhook_activities
             ]
             logging.info("Webhook activities for %s: %s", tx_hash, ", ".join(summary))
+
         receipt = self.chain.get_receipt(tx_hash)
         if not receipt:
             logging.warning("No receipt returned for transaction %s", tx_hash)
@@ -63,29 +64,60 @@ class SmartMoneyEngine:
             logging.info("Skipping failed transaction %s (status=%s)", tx_hash, receipt.get("status"))
             return False
 
+        # Get transaction metadata early.  tx.from is especially important for
+        # native-ETH-funded swaps because ETH does not have an ERC20 Transfer log.
+        tx = self.chain.rpc("eth_getTransactionByHash", [tx_hash]) or {}
+        tx_from = (tx.get("from") or "").lower()
+        native_value = int(tx.get("value", "0x0"), 16)
+
         transfers = self.chain.receipt_transfers(receipt)
 
-        # Alchemy Address Activity is itself an indexed transfer feed. Prefer its
-        # token-transfer records when available; this also covers cases where a
-        # provider receipt is valid but its log representation is incomplete.
+        # Alchemy Address Activity is an indexed transfer feed. Prefer its token
+        # records when available, but normalize several possible field locations.
         webhook_transfers = []
+        activity_addresses = set()
+        native_activities = []
         for a in webhook_activities:
+            from_addr = (a.get("fromAddress") or a.get("from") or "").lower()
+            to_addr = (a.get("toAddress") or a.get("to") or "").lower()
+            if from_addr:
+                activity_addresses.add(from_addr)
+            if to_addr:
+                activity_addresses.add(to_addr)
+
             category = str(a.get("category") or "").lower()
+            asset = str(a.get("asset") or "").upper()
+            if category in {"external", "internal", "eth"} or asset == "ETH":
+                native_activities.append(a)
+
             if category not in {"token", "erc20"}:
                 continue
             raw = a.get("rawContract") or {}
-            token = (raw.get("address") or a.get("contractAddress") or "").lower()
+            token = (
+                raw.get("address")
+                or a.get("contractAddress")
+                or a.get("address")
+                or (a.get("log") or {}).get("address")
+                or ""
+            ).lower()
             if not token:
+                logging.warning("Skipping Alchemy token activity with no token address: %s", a)
                 continue
-            raw_value = raw.get("rawValue") or "0x0"
+
+            raw_value = raw.get("rawValue")
+            if raw_value is None:
+                raw_value = a.get("rawValue")
+            if raw_value is None:
+                raw_value = "0x0"
             try:
                 amount_raw = int(raw_value, 16) if isinstance(raw_value, str) else int(raw_value or 0)
             except (TypeError, ValueError):
                 amount_raw = 0
+
             webhook_transfers.append({
                 "token": token,
-                "from": (a.get("fromAddress") or "").lower(),
-                "to": (a.get("toAddress") or "").lower(),
+                "from": from_addr,
+                "to": to_addr,
                 "amount_raw": amount_raw,
                 "source": "alchemy_webhook",
             })
@@ -93,16 +125,20 @@ class SmartMoneyEngine:
         if webhook_transfers:
             transfers = webhook_transfers
             logging.info("Using %d token transfers directly from Alchemy Address Activity", len(transfers))
+            for x in transfers:
+                logging.info(
+                    "Alchemy transfer token=%s from=%s to=%s amount_raw=%s",
+                    x["token"], x["from"], x["to"], x["amount_raw"]
+                )
         else:
             logging.info("Transaction %s contains %d ERC20 Transfer logs", tx_hash, len(transfers))
 
         if not transfers:
-            # Native ETH-only activity is valid, but cannot by itself identify a
-            # token buy. Keep the event visible in logs rather than treating it as
-            # an RPC failure.
-            native_activities = [a for a in webhook_activities if str(a.get("asset") or "").upper() == "ETH" or str(a.get("category") or "").lower() in {"external", "internal"}]
             if native_activities:
-                logging.info("Transaction %s has %d native ETH activities; no token transfer to score", tx_hash, len(native_activities))
+                logging.info(
+                    "Transaction %s has %d native ETH activities; no token transfer to score",
+                    tx_hash, len(native_activities)
+                )
             return False
 
         block = int(receipt.get("blockNumber", "0x0"), 16)
@@ -111,33 +147,55 @@ class SmartMoneyEngine:
             int(block_data.get("timestamp", "0x0"), 16), tz=timezone.utc
         ).isoformat()
 
-        tx = self.chain.rpc("eth_getTransactionByHash", [tx_hash]) or {}
-        tx_from = (tx.get("from") or "").lower()
-        native_value = int(tx.get("value", "0x0"), 16)
+        monitored = {a.lower(): meta for a, meta in Config.SMART_WALLETS.items()}
+
+        # A monitored wallet can be identified from any of these sources.  This
+        # is more robust than assuming only the ERC20 transfer endpoints expose
+        # the wallet, which can fail with smart-account/router execution paths.
+        candidate_wallets = set()
+        if tx_from in monitored:
+            candidate_wallets.add(tx_from)
+        candidate_wallets.update(activity_addresses.intersection(monitored.keys()))
+        for x in transfers:
+            if x["from"] in monitored:
+                candidate_wallets.add(x["from"])
+            if x["to"] in monitored:
+                candidate_wallets.add(x["to"])
+
+        logging.info(
+            "Wallet detection tx=%s tx_from=%s monitored_candidates=%s",
+            tx_hash, tx_from, sorted(candidate_wallets)
+        )
 
         touched_tokens = set()
         recorded = False
 
-        # A buy must have BOTH:
-        #   1) tokens transferred into the smart wallet, and
-        #   2) quote/native value sent out by that same wallet.
-        for wallet in Config.SMART_WALLETS:
-            wallet = wallet.lower()
+        for wallet in candidate_wallets:
             incoming = [
                 x for x in transfers
-                if x["to"] == wallet and x["token"] not in Config.QUOTE_ASSETS
+                if x["to"] == wallet and x["token"] not in Config.QUOTE_ASSETS and int(x.get("amount_raw", 0)) > 0
             ]
             outgoing_quote = [
                 x for x in transfers
-                if x["from"] == wallet and x["token"] in Config.QUOTE_ASSETS
+                if x["from"] == wallet and x["token"] in Config.QUOTE_ASSETS and int(x.get("amount_raw", 0)) > 0
             ]
 
             quote_amount = sum(int(x.get("amount_raw", 0)) for x in outgoing_quote)
 
-            # Native value belongs to the transaction sender, not every wallet
-            # touched by the transaction.
+            # Native ETH can fund a buy even when the quote leg is not an ERC20
+            # transfer. Count it only for the actual transaction sender.
             if tx_from == wallet and native_value > 0:
                 quote_amount += native_value
+
+            # If Alchemy delivered a native-ETH activity for this wallet, it is
+            # additional evidence that the wallet participated in the transaction.
+            # We do not invent an amount from the webhook; tx.value remains the
+            # authoritative native amount when tx.from == wallet.
+
+            logging.info(
+                "Wallet analysis wallet=%s incoming=%d outgoing_quote=%d quote_raw=%s",
+                wallet, len(incoming), len(outgoing_quote), quote_amount
+            )
 
             if not incoming or quote_amount <= 0:
                 continue
@@ -161,9 +219,10 @@ class SmartMoneyEngine:
                 touched_tokens.add(transfer["token"])
                 recorded = True
 
-        # Evaluate only after every wallet/trade in this transaction has been
-        # recorded, so convergence is calculated from the complete event.
-        logging.info("Transaction %s recorded=%s touched_tokens=%d", tx_hash, recorded, len(touched_tokens))
+        logging.info(
+            "Transaction %s recorded=%s touched_tokens=%d",
+            tx_hash, recorded, len(touched_tokens)
+        )
         for token in touched_tokens:
             try:
                 self.evaluate_token(token, reference_time=ts)
