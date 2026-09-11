@@ -17,8 +17,21 @@ class SmartMoneyEngine:
             db.upsert_wallet(address, meta["label"], meta["quality"])
 
     def process_alchemy_event(self, payload):
-        activities = (payload.get("event") or {}).get("activity") or []
-        tx_hashes = {a.get("transactionHash") for a in activities if a.get("transactionHash")}
+        event = payload.get("event") or {}
+        activities = event.get("activity") or []
+        # Alchemy Address Activity uses `hash` for the transaction hash.
+        # Keep `transactionHash` as a compatibility fallback for older/custom payloads.
+        tx_hashes = {
+            (a.get("hash") or a.get("transactionHash"))
+            for a in activities
+            if (a.get("hash") or a.get("transactionHash"))
+        }
+        logging.info(
+            "Alchemy event type=%s network=%s activities=%d tx_hashes=%d",
+            payload.get("type"), event.get("network"), len(activities), len(tx_hashes)
+        )
+        if not tx_hashes:
+            logging.info("Alchemy event contained no transaction hashes; nothing to process")
         count = 0
         for tx_hash in tx_hashes:
             try:
@@ -28,11 +41,17 @@ class SmartMoneyEngine:
         return count
 
     def process_transaction(self, tx_hash):
+        logging.info("Processing transaction %s", tx_hash)
         receipt = self.chain.get_receipt(tx_hash)
         if not receipt:
+            logging.warning("No receipt returned for transaction %s", tx_hash)
+            return False
+        if receipt.get("status") not in (None, "0x1"):
+            logging.info("Skipping failed transaction %s (status=%s)", tx_hash, receipt.get("status"))
             return False
 
         transfers = self.chain.receipt_transfers(receipt)
+        logging.info("Transaction %s contains %d ERC20 Transfer logs", tx_hash, len(transfers))
         if not transfers:
             return False
 
@@ -73,6 +92,10 @@ class SmartMoneyEngine:
             if not incoming or quote_amount <= 0:
                 continue
 
+            logging.info(
+                "BUY candidate wallet=%s token_count=%d quote_raw=%s tx=%s",
+                wallet, len(incoming), quote_amount, tx_hash
+            )
             for transfer in incoming:
                 self.db.add_trade(
                     tx_hash,
@@ -90,6 +113,7 @@ class SmartMoneyEngine:
 
         # Evaluate only after every wallet/trade in this transaction has been
         # recorded, so convergence is calculated from the complete event.
+        logging.info("Transaction %s recorded=%s touched_tokens=%d", tx_hash, recorded, len(touched_tokens))
         for token in touched_tokens:
             try:
                 self.evaluate_token(token, reference_time=ts)

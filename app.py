@@ -28,11 +28,21 @@ def health():
 @app.post("/webhook/alchemy")
 def alchemy_webhook():
     raw = request.get_data()
-    if not verify_signature(raw, request.headers.get("X-Alchemy-Signature", "")):
+    signature = request.headers.get("X-Alchemy-Signature", "")
+    if not verify_signature(raw, signature):
+        logging.warning("Rejected Alchemy webhook: invalid signature")
         return jsonify(ok=False, error="invalid signature"), 401
     try:
         payload = request.get_json(silent=True) or {}
-        return jsonify(ok=True, processed=engine.process_alchemy_event(payload))
+        event = payload.get("event") or {}
+        activities = event.get("activity") or []
+        logging.info(
+            "Alchemy webhook received type=%s network=%s activities=%d",
+            payload.get("type"), event.get("network"), len(activities)
+        )
+        processed = engine.process_alchemy_event(payload)
+        logging.info("Alchemy webhook completed processed=%d", processed)
+        return jsonify(ok=True, processed=processed)
     except Exception:
         logging.exception("Webhook processing failed")
         return jsonify(ok=False, error="processing failure"), 500
