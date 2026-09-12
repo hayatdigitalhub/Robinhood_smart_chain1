@@ -49,12 +49,23 @@ class SmartMoneyEngine:
     def process_transaction(self, tx_hash, webhook_activities=None):
         logging.info("Processing transaction %s", tx_hash)
         webhook_activities = webhook_activities or []
+
+        # Address Activity may split one transaction across multiple webhook
+        # deliveries (for example ETH in one delivery and token transfers in
+        # another). Persist and merge fragments for a short window so BUY
+        # classification sees the complete transaction.
+        if webhook_activities:
+            self.db.cache_activities(tx_hash, webhook_activities)
+        merged_activities = self.db.get_cached_activities(tx_hash)
+        if merged_activities:
+            webhook_activities = merged_activities
+
         if webhook_activities:
             summary = [
                 f"{a.get('category')}:{a.get('asset') or a.get('rawContract', {}).get('address') or 'native'}"
                 for a in webhook_activities
             ]
-            logging.info("Webhook activities for %s: %s", tx_hash, ", ".join(summary))
+            logging.info("Merged webhook activities for %s: %s", tx_hash, ", ".join(summary))
 
         receipt = self.chain.get_receipt(tx_hash)
         if not receipt:
@@ -183,18 +194,44 @@ class SmartMoneyEngine:
             quote_amount = sum(int(x.get("amount_raw", 0)) for x in outgoing_quote)
 
             # Native ETH can fund a buy even when the quote leg is not an ERC20
-            # transfer. Count it only for the actual transaction sender.
+            # transfer. First use the top-level transaction value when the
+            # monitored wallet is the sender. Then use Alchemy's internal/external
+            # ETH activities when the wallet sends ETH through a router/account.
+            native_quote_raw = 0
             if tx_from == wallet and native_value > 0:
-                quote_amount += native_value
+                native_quote_raw += native_value
 
-            # If Alchemy delivered a native-ETH activity for this wallet, it is
-            # additional evidence that the wallet participated in the transaction.
-            # We do not invent an amount from the webhook; tx.value remains the
-            # authoritative native amount when tx.from == wallet.
+            for a in native_activities:
+                a_from = (a.get("fromAddress") or a.get("from") or "").lower()
+                if a_from != wallet:
+                    continue
+                raw = (a.get("rawContract") or {}).get("rawValue")
+                if raw is None:
+                    raw = a.get("rawValue")
+                if raw is None:
+                    value = a.get("value")
+                    if value is not None:
+                        try:
+                            native_quote_raw += int(float(value) * 10**18)
+                        except (TypeError, ValueError):
+                            pass
+                else:
+                    try:
+                        native_quote_raw += int(raw, 16) if isinstance(raw, str) else int(raw)
+                    except (TypeError, ValueError):
+                        pass
+
+            if native_quote_raw > 0:
+                quote_amount += native_quote_raw
+                logging.info(
+                    "Native ETH quote evidence wallet=%s raw=%s", wallet, native_quote_raw
+                )
 
             logging.info(
-                "Wallet analysis wallet=%s incoming=%d outgoing_quote=%d quote_raw=%s",
-                wallet, len(incoming), len(outgoing_quote), quote_amount
+                "Wallet analysis wallet=%s incoming=%d outgoing_quote=%d native_activities=%d quote_raw=%s",
+                wallet, len(incoming), len(outgoing_quote),
+                sum(1 for a in native_activities if (a.get("fromAddress") or a.get("from") or "").lower() == wallet),
+                quote_amount
             )
 
             if not incoming or quote_amount <= 0:

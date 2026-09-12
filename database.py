@@ -1,6 +1,8 @@
 import os
 import sqlite3
 import threading
+import json
+import hashlib
 from datetime import datetime, timezone
 
 
@@ -29,6 +31,13 @@ class Database:
             CREATE TABLE IF NOT EXISTS alerts(
               id INTEGER PRIMARY KEY AUTOINCREMENT,token TEXT,score REAL,level TEXT,
               wallets TEXT,created_at TEXT DEFAULT CURRENT_TIMESTAMP);
+            CREATE TABLE IF NOT EXISTS tx_activities(
+              id INTEGER PRIMARY KEY AUTOINCREMENT,tx_hash TEXT,activity_key TEXT,
+              raw_json TEXT,created_at TEXT DEFAULT CURRENT_TIMESTAMP);
+            CREATE UNIQUE INDEX IF NOT EXISTS ux_tx_activities_identity
+              ON tx_activities(tx_hash,activity_key);
+            CREATE INDEX IF NOT EXISTS idx_tx_activities_time
+              ON tx_activities(tx_hash,created_at);
             CREATE INDEX IF NOT EXISTS idx_trades_token ON trades(token);
             CREATE INDEX IF NOT EXISTS idx_trades_token_time ON trades(token,timestamp);
             """)
@@ -72,6 +81,44 @@ class Database:
             c.execute("CREATE INDEX IF NOT EXISTS idx_trades_token_time ON trades(token,timestamp)")
             c.commit()
             c.close()
+
+    def cache_activities(self, tx_hash, activities, max_age_minutes=10):
+        """Persist webhook fragments so separate Address Activity deliveries for the
+        same transaction can be reconstructed before BUY classification."""
+        if not activities:
+            return
+        now = datetime.now(timezone.utc).isoformat()
+        with self.lock:
+            c = self.connect()
+            for activity in activities:
+                raw = json.dumps(activity, sort_keys=True, separators=(",", ":"), default=str)
+                key = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+                c.execute(
+                    "INSERT OR IGNORE INTO tx_activities(tx_hash,activity_key,raw_json,created_at) VALUES(?,?,?,?)",
+                    (tx_hash.lower(), key, raw, now),
+                )
+            c.execute(
+                "DELETE FROM tx_activities WHERE created_at < ?",
+                ((datetime.now(timezone.utc) - timedelta(minutes=max_age_minutes)).isoformat(),),
+            )
+            c.commit()
+            c.close()
+
+    def get_cached_activities(self, tx_hash, max_age_minutes=10):
+        cutoff = (datetime.now(timezone.utc) - timedelta(minutes=max_age_minutes)).isoformat()
+        c = self.connect()
+        rows = c.execute(
+            "SELECT raw_json FROM tx_activities WHERE tx_hash=? AND created_at>=? ORDER BY id",
+            (tx_hash.lower(), cutoff),
+        ).fetchall()
+        c.close()
+        out = []
+        for row in rows:
+            try:
+                out.append(json.loads(row["raw_json"]))
+            except (TypeError, ValueError):
+                pass
+        return out
 
     def upsert_wallet(self, address, label, quality):
         with self.lock:
